@@ -34,6 +34,7 @@ import {
   getMostRecentUserMessage,
   sanitizeResponseMessages,
 } from '@/lib/utils';
+import { checkTimeoutExtension, clearTimeoutExtension, checkTerminationStatus } from '@/lib/research-utils';
 
 import { generateTitleFromUserMessage } from '../../actions';
 import FirecrawlApp from '@mendable/firecrawl-js';
@@ -43,7 +44,6 @@ type AllowedTools =
   | 'search'
   | 'extract'
   | 'scrape';
-
 
 const firecrawlTools: AllowedTools[] = ['search', 'extract', 'scrape'];
 
@@ -75,53 +75,13 @@ export async function POST(request: Request) {
   } = await request.json();
 
   let session = await auth();
-
-  // If no session exists, create an anonymous session
-  if (!session?.user) {
-    try {
-      const result = await signIn('credentials', {
-        redirect: false,
-      });
-
-      if (result?.error) {
-        console.error('Failed to create anonymous session:', result.error);
-        return new Response('Failed to create anonymous session', {
-          status: 500,
-        });
-      }
-
-      // Wait for the session to be fully established
-      let retries = 3;
-      while (retries > 0) {
-        session = await auth();
-        
-        if (session?.user?.id) {
-          // Verify user exists in database
-          const users = await getUser(session.user.email as string);
-          if (users.length > 0) {
-            break;
-          }
-        }
-        
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        retries--;
-      }
-
-      if (!session?.user) {
-        console.error('Failed to get session after creation');
-        return new Response('Failed to create session', { status: 500 });
-      }
-    } catch (error) {
-      console.error('Error creating anonymous session:', error);
-      return new Response('Failed to create anonymous session', {
-        status: 500,
-      });
-    }
-  }
-
+  
+  // Block unauthenticated requests
   if (!session?.user?.id) {
-    return new Response('Failed to create session', { status: 500 });
+    return new Response('Unauthorized', { status: 401 });
   }
+
+  const userId = session.user.id;
 
   // Verify user exists in database before proceeding
   try {
@@ -136,7 +96,7 @@ export async function POST(request: Request) {
   }
 
   // Apply rate limiting
-  const identifier = session.user.id;
+  const identifier = userId;
   const { success, limit, reset, remaining } =
     await rateLimiter.limit(identifier);
 
@@ -162,7 +122,7 @@ export async function POST(request: Request) {
 
   if (!chat) {
     const title = await generateTitleFromUserMessage({ message: userMessage });
-    await saveChat({ id, userId: session.user.id, title });
+    await saveChat({ id, userId, title });
   }
 
   const userMessageId = generateUUID();
@@ -318,8 +278,14 @@ export async function POST(request: Request) {
             execute: async ({ topic, maxDepth = 7 }) => {
               const startTime = Date.now();
               const timeLimit = 4.5 * 60 * 1000; // 4 minutes 30 seconds in milliseconds
+              const researchId = generateUUID();
 
               const researchState = {
+                id: researchId,
+                topic,
+                chatId: id,
+                userId,
+                startTime: new Date(),
                 findings: [] as Array<{ text: string; source: string }>,
                 summaries: [] as Array<string>,
                 nextSearchTopic: '',
@@ -329,7 +295,17 @@ export async function POST(request: Request) {
                 maxFailedAttempts: 3,
                 completedSteps: 0,
                 totalExpectedSteps: maxDepth * 5,
+                status: 'in_progress' as 'in_progress' | 'completed' | 'timed_out' | 'error' | 'manually_terminated',
               };
+
+              // Store initial research state in database
+              await saveDocument({
+                id: researchState.id,
+                userId,
+                kind: 'text',
+                content: JSON.stringify(researchState),
+                title: `Research: ${topic}`,
+              });
 
               // Initialize progress tracking
               dataStream.writeData({
@@ -474,7 +450,64 @@ export async function POST(request: Request) {
               try {
                 while (researchState.currentDepth < maxDepth) {
                   const timeElapsed = Date.now() - startTime;
+                  
+                  // Check if timeout extension was requested
+                  const extensionRequested = await checkTimeoutExtension(researchId);
+                  
+                  // If near timeout but extension requested, add more time
+                  if (timeElapsed >= timeLimit && extensionRequested) {
+                    // Add 5 more minutes
+                    const extensionTime = 5 * 60 * 1000;
+                    
+                    addActivity({
+                      type: 'thought',
+                      status: 'complete',
+                      message: `Timeout extended by 5 minutes`,
+                      timestamp: new Date().toISOString(),
+                      depth: researchState.currentDepth,
+                    });
+                    
+                    // Mark extension as used
+                    await clearTimeoutExtension(researchId);
+                    continue;
+                  }
+                  
                   if (timeElapsed >= timeLimit) {
+                    // Update research status to timed_out
+                    researchState.status = 'timed_out';
+                    // Persist partial research results before timing out
+                    await saveDocument({
+                      id: researchState.id,
+                      userId,
+                      kind: 'text',
+                      content: JSON.stringify(researchState),
+                      title: `Research: ${topic}`,
+                    });
+
+                    break;
+                  }
+                  
+                  // Check if manual termination was requested
+                  const terminationRequested = await checkTerminationStatus(researchId);
+                  if (terminationRequested) {
+                    researchState.status = 'manually_terminated';
+                    addActivity({
+                      type: 'thought',
+                      status: 'complete',
+                      message: 'Research manually terminated by user',
+                      timestamp: new Date().toISOString(),
+                      depth: researchState.currentDepth,
+                    });
+                    
+                    // Save the current state before terminating
+                    await saveDocument({
+                      id: researchState.id,
+                      userId,
+                      kind: 'text',
+                      content: JSON.stringify(researchState),
+                      title: `Research: ${topic}`,
+                    });
+                    
                     break;
                   }
 
@@ -597,6 +630,15 @@ export async function POST(request: Request) {
                   }
 
                   topic = analysis.gaps.shift() || topic;
+
+                  // Save research progress after each depth level
+                  await saveDocument({
+                    id: researchState.id,
+                    userId,
+                    kind: 'text',
+                    content: JSON.stringify(researchState),
+                    title: `Research: ${topic}`,
+                  });
                 }
 
                 // Final synthesis
@@ -608,17 +650,49 @@ export async function POST(request: Request) {
                   depth: researchState.currentDepth,
                 });
 
-                const finalAnalysis = await generateText({
-                  model: customModel(reasoningModel.apiIdentifier, true),
-                  maxTokens: 16000,
-                  prompt: `Create a comprehensive long analysis of ${topic} based on these findings:
-                          ${researchState.findings
-                      .map((f) => `[From ${f.source}]: ${f.text}`)
-                      .join('\n')}
-                          ${researchState.summaries
-                            .map((s) => `[Summary]: ${s}`)
-                            .join('\n')}
-                          Provide all the thoughts processes including findings details,key insights, conclusions, and any remaining uncertainties. Include citations to sources where appropriate. This analysis should be very comprehensive and full of details. It is expected to be very long, detailed and comprehensive.`,
+                let finalAnalysisText = '';
+                
+                try {
+                  // Generate content based on status
+                  const statusWarning = researchState.status === 'timed_out' 
+                    ? "IMPORTANT: This research was interrupted due to time constraints before completion. The following analysis is based on partial data."
+                    : researchState.status === 'manually_terminated'
+                    ? "IMPORTANT: This research was manually stopped by the user. The following analysis is based on partial data."
+                    : '';
+                  
+                  const finalAnalysis = await generateText({
+                    model: customModel(reasoningModel.apiIdentifier, true),
+                    maxTokens: 16000,
+                    prompt: `Create a comprehensive analysis of ${topic} based on these findings:
+                            ${researchState.findings
+                        .map((f) => `[From ${f.source}]: ${f.text}`)
+                        .join('\n')}
+                            ${researchState.summaries
+                              .map((s) => `[Summary]: ${s}`)
+                              .join('\n')}
+                            ${statusWarning}
+                            Provide all the thoughts processes including findings details, key insights, conclusions, and any remaining uncertainties. Include citations to sources where appropriate. This analysis should be very comprehensive and full of details.`,
+                  });
+                  
+                  finalAnalysisText = finalAnalysis.text;
+                } catch (error) {
+                  console.error('Final analysis generation failed:', error);
+                  // Create a fallback analysis if the LLM fails
+                  finalAnalysisText = `Research on ${topic} could not be fully synthesized due to an error.\n\nHere are the findings collected:\n\n${
+                    researchState.findings.map((f) => `- From ${f.source}: ${f.text.substring(0, 300)}...`).join('\n\n')
+                  }\n\nSummaries:\n\n${
+                    researchState.summaries.join('\n\n')
+                  }`;
+                }
+
+                // Mark research as completed and save final state
+                researchState.status = researchState.status === 'in_progress' ? 'completed' : researchState.status;
+                await saveDocument({
+                  id: researchState.id,
+                  userId,
+                  kind: 'text',
+                  content: JSON.stringify(researchState),
+                  title: `Research: ${topic}`,
                 });
 
                 addActivity({
@@ -631,16 +705,18 @@ export async function POST(request: Request) {
 
                 dataStream.writeData({
                   type: 'finish',
-                  content: finalAnalysis.text,
+                  content: finalAnalysisText,
                 });
 
                 return {
                   success: true,
                   data: {
+                    researchId: researchState.id,
                     findings: researchState.findings,
-                    analysis: finalAnalysis.text,
+                    analysis: finalAnalysisText,
                     completedSteps: researchState.completedSteps,
                     totalSteps: researchState.totalExpectedSteps,
+                    status: researchState.status
                   },
                 };
               } catch (error: any) {
@@ -654,13 +730,25 @@ export async function POST(request: Request) {
                   depth: researchState.currentDepth,
                 });
 
+                // Mark research as error and save current state
+                researchState.status = 'error';
+                await saveDocument({
+                  id: researchState.id,
+                  userId,
+                  kind: 'text',
+                  content: JSON.stringify(researchState),
+                  title: `Research: ${topic}`,
+                });
+
                 return {
                   success: false,
                   error: error.message,
                   data: {
+                    researchId: researchState.id,
                     findings: researchState.findings,
                     completedSteps: researchState.completedSteps,
                     totalSteps: researchState.totalExpectedSteps,
+                    status: researchState.status
                   },
                 };
               }
@@ -668,7 +756,7 @@ export async function POST(request: Request) {
           },
         },
         onFinish: async ({ response }) => {
-          if (session.user?.id) {
+          if (userId) {
             try {
               const responseMessagesWithoutIncompleteToolCalls =
                 sanitizeResponseMessages(response.messages);
@@ -720,22 +808,17 @@ export async function DELETE(request: Request) {
 
   let session = await auth();
 
-  // If no session exists, create an anonymous session
-  if (!session?.user) {
-    await signIn('credentials', {
-      redirect: false,
-    });
-    session = await auth();
+  // Block unauthenticated requests
+  if (!session?.user?.id) {
+    return new Response('Unauthorized', { status: 401 });
   }
 
-  if (!session?.user?.id) {
-    return new Response('Failed to create session', { status: 500 });
-  }
+  const userId = session.user.id;
 
   try {
     const chat = await getChatById({ id });
 
-    if (chat.userId !== session.user.id) {
+    if (chat.userId !== userId) {
       return new Response('Unauthorized', { status: 401 });
     }
 

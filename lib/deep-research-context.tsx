@@ -70,7 +70,7 @@ const initialState: DeepResearchState = {
   activity: [],
   sources: [],
   currentDepth: 0,
-  maxDepth: 7,
+  maxDepth: 30,  // Doubled from 15 to allow even deeper exploration
   completedSteps: 0,
   totalExpectedSteps: 0,
 };
