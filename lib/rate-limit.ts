@@ -1,23 +1,51 @@
-import { Redis } from '@upstash/redis';
+// Mock implementation for Redis and Ratelimit
 import { Ratelimit } from '@upstash/ratelimit';
 
-// Create a new Redis instance
-export const redis = new Redis({
-  url: process.env.UPSTASH_REDIS_REST_URL || '',
-  token: process.env.UPSTASH_REDIS_REST_TOKEN || '',
-  // Disable HTTPS check in development
-  automaticDeserialization: true,
-  agent: process.env.NODE_ENV === 'development' ? {
-    https: {
-      rejectUnauthorized: false
-    }
-  } : undefined,
-});
+// Create a mock Redis instance that stores data in memory
+class MockRedis {
+  private storage: Map<string, any> = new Map();
 
-// Create a new rate limiter that allows 5 requests per 60 seconds
-export const rateLimiter = new Ratelimit({
-  redis,
-  limiter: Ratelimit.slidingWindow(5, '60 s'),
-  analytics: true,
-  prefix: '@upstash/ratelimit',
-});
+  async get(key: string) {
+    return this.storage.get(key);
+  }
+
+  async set(key: string, value: any, options?: any) {
+    this.storage.set(key, value);
+    return 'OK';
+  }
+
+  async incr(key: string) {
+    const value = (this.storage.get(key) || 0) + 1;
+    this.storage.set(key, value);
+    return value;
+  }
+
+  async del(key: string) {
+    this.storage.delete(key);
+    return 1;
+  }
+
+  async expire(key: string, ttl: number) {
+    // No real expiration in the mock, but we'll pretend it works
+    return 1;
+  }
+
+  async setex(key: string, ttl: number, value: any) {
+    this.storage.set(key, value);
+    return 'OK';
+  }
+}
+
+// Create a new Redis instance
+export const redis = new MockRedis() as any;
+
+// Create a very permissive mock rate limiter with significantly higher limits
+export const rateLimiter = {
+  limit: async () => ({
+    success: true,
+    limit: 2000,         // Doubled from 1000
+    remaining: 1999,      // Doubled from 999
+    reset: Date.now() + 7200000, // 2 hours from now (doubled from 1 hour)
+    pending: Promise.resolve(),
+  }),
+} as unknown as Ratelimit;

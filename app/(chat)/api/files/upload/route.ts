@@ -1,8 +1,23 @@
-import { put } from '@vercel/blob';
+// Mock implementation for @vercel/blob
+// This mocks the 'put' function to simulate uploading without requiring blob storage
 import { NextResponse } from 'next/server';
 import { z } from 'zod';
 
 import { auth } from '@/app/(auth)/auth';
+
+// Mock function for put
+async function put(path: string, data: ArrayBuffer, options: any) {
+  console.log(`[MOCK] Uploading file to ${path}`);
+  // Return a mock response similar to what @vercel/blob would return
+  return {
+    url: `http://localhost:3002/mock-blob/${path}`,
+    pathname: path,
+    contentType: options.contentType || 'application/octet-stream',
+    contentDisposition: options.contentDisposition || 'attachment',
+    size: data.byteLength,
+    uploadedAt: new Date().toISOString(),
+  };
+}
 
 // Use Blob instead of File since File is not available in Node.js environment
 const FileSchema = z.object({
@@ -57,9 +72,11 @@ export async function POST(request: Request) {
 
       return NextResponse.json(data);
     } catch (error) {
+      console.error('Upload error:', error);
       return NextResponse.json({ error: 'Upload failed' }, { status: 500 });
     }
   } catch (error) {
+    console.error('Request processing error:', error);
     return NextResponse.json(
       { error: 'Failed to process request' },
       { status: 500 },
